@@ -1,0 +1,17 @@
+# local phase-0 experiment, not part of the project
+phase0-ministack/
+
+# datasets (reproducible via downloader), except the small built-in sample
+data/*
+!data/sample/
+
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor noise
+Thumbs.db
+.DS_Store

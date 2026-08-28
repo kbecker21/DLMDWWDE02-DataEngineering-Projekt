@@ -1,0 +1,12 @@
+services:
+  # one-off setup step, not part of the running stack:
+  #   docker compose run --rm downloader
+  downloader:
+    build: ./downloader
+    profiles: ["setup"]
+    environment:
+      OUT_DIR: /data/eea_e1a_2024
+      EEA_MIRROR_URL: ${EEA_MIRROR_URL:-https://github.com/kbecker21/DLMDWWDE02-DataEngineering-Projekt/releases/download/data-v1/eea_e1a_2024.zip}
+      DOWNLOAD_WORKERS: ${DOWNLOAD_WORKERS:-8}
+    volumes:
+      - ./data:/data
