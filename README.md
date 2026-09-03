@@ -22,17 +22,30 @@ container, then a mirror of the 2024 cut attached to a GitHub release.
 Output goes to `data/eea_e1a_2024/` (gitignored). Re-running resumes.
 
 There is also a small sample in `data/sample/` (4 Berlin stations, ~3 MB),
-so the stack can be tried without downloading anything.
+so the stack can be tried without downloading anything: set
+`DATA_DIR=./data/sample` in `.env`.
 
 Data © [European Environment Agency](https://www.eea.europa.eu/), licensed
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The release mirror
 is an unmodified subset (year 2024, Germany) of that dataset.
+
+## Setup
+
+    cp .env.example .env
+    docker compose run --rm downloader     # once, skip when using the sample
+    docker compose run --rm preprocess     # merge + sort -> data/replay/events.parquet
+    docker compose up -d
+
+The preprocess step merges the per-station files into one file sorted by
+timestamp, which the replay producer streams in event-time order.
+Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions).
 
 ## Layout
 
     docker-compose.yml    full stack (infrastructure as code)
     .env.example          config template, copy to .env
     downloader/           one-off data downloader
+    preprocess/           one-off merge + sort of the raw files
     producer/             replay producer
     processor/            Spark Structured Streaming job
     db/                   TimescaleDB init scripts
