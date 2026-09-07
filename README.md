@@ -37,7 +37,13 @@ is an unmodified subset (year 2024, Germany) of that dataset.
     docker compose up -d
 
 The preprocess step merges the per-station files into one file sorted by
-timestamp, which the replay producer streams in event-time order.
+timestamp. The producer replays it into Kafka as one JSON event per
+measurement, keyed by station, with event time running `REPLAY_SPEED` times
+faster than wall clock (default: one day per minute, so 2024 takes about six
+hours). Only validated values (`Validity = 1`) are sent; timestamps are
+converted from the EEA's fixed UTC+1 to UTC. `LATE_EVENT_RATE` holds back a
+share of events by 1-4 hours of event time to exercise late-data handling.
+
 Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions).
 
 ## Layout

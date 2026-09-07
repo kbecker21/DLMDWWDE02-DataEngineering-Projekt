@@ -69,6 +69,23 @@ services:
       - --replication-factor
       - "1"
 
+  producer:
+    build: ./producer
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-sensor-events}
+      REPLAY_SPEED: ${REPLAY_SPEED:-1440}
+      LATE_EVENT_RATE: ${LATE_EVENT_RATE:-0}
+    volumes:
+      - ./data/replay:/data:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    # exits when the replay is through; only restart on errors
+    restart: on-failure
+
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
     environment:
