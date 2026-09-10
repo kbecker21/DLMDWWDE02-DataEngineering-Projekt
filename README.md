@@ -4,9 +4,9 @@ IU portfolio project (module "Projekt: Data Engineering", task 2): a
 containerized streaming pipeline that ingests air quality measurements as a
 replayed stream and serves windowed aggregates for reporting.
 
-Planned pipeline: replay producer -> Kafka -> Spark Structured Streaming ->
+Pipeline: replay producer -> Kafka -> Spark Structured Streaming ->
 TimescaleDB -> Grafana. Runs locally with Docker Compose. Work in progress,
-built up service by service.
+built up service by service; producer, Kafka and the first Spark query are in.
 
 ## Data
 
@@ -45,6 +45,27 @@ converted from the EEA's fixed UTC+1 to UTC. `LATE_EVENT_RATE` holds back a
 share of events by 1-4 hours of event time to exercise late-data handling.
 
 Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions).
+
+## Processing
+
+The Spark job (`processor/`) reads the topic, parses each event against an
+explicit schema and drops what does not fit (malformed JSON, missing or
+non-numeric fields). Valid events are aggregated into 6-hour tumbling windows
+per station and pollutant (avg/min/max/count) with a 3-hour watermark, so
+a window stays open for three hours after it ends and events arriving later
+than that are discarded. (The producer's 1-4 h late simulation therefore
+passes through; `dropped_late` only counts events for an already closed
+window.) Both counts are logged per micro-batch:
+
+    processor-1  | ... batch=12 input=4049 invalid=3 dropped_late=1 output=1086 ...
+
+Results currently go to the console (`docker compose logs -f processor`);
+the TimescaleDB sink is next. Checkpoints live on the `spark-checkpoints`
+volume, so a restarted processor resumes where it left off.
+
+`docker compose down -v` resets Kafka data and Spark checkpoints together.
+Do this after changing the query: a checkpoint written by the old query
+cannot be resumed by the new one.
 
 ## Layout
 

@@ -86,6 +86,25 @@ services:
     # exits when the replay is through; only restart on errors
     restart: on-failure
 
+  processor:
+    build: ./processor
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-sensor-events}
+      TRIGGER_SECONDS: ${TRIGGER_SECONDS:-10}
+    volumes:
+      - spark-checkpoints:/checkpoints
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+    restart: unless-stopped
+
   kafka-ui:
     image: kafbat/kafka-ui:v1.5.0
     environment:
@@ -100,3 +119,4 @@ services:
 
 volumes:
   kafka-data:
+  spark-checkpoints:
