@@ -86,19 +86,60 @@ services:
     # exits when the replay is through; only restart on errors
     restart: on-failure
 
+  timescaledb:
+    image: timescale/timescaledb:2.29.0-pg17
+    environment:
+      POSTGRES_DB: ${DB_NAME:-airquality}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:?set in .env}
+      # used by db/02_roles.sh on first start
+      SPARK_DB_PASSWORD: ${SPARK_DB_PASSWORD:?set in .env}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?set in .env}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - tsdb-data:/var/lib/postgresql/data
+      # init scripts only run when the data volume is empty; mounted one by
+      # one so the image's own extension setup in that directory stays
+      - ./db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/02_roles.sh:/docker-entrypoint-initdb.d/02_roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${DB_NAME:-airquality}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    restart: unless-stopped
+
   processor:
     build: ./processor
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       KAFKA_TOPIC: ${KAFKA_TOPIC:-sensor-events}
       TRIGGER_SECONDS: ${TRIGGER_SECONDS:-10}
+      DB_HOST: timescaledb
+      DB_NAME: ${DB_NAME:-airquality}
+      DB_USER: spark
+      DB_PASSWORD: ${SPARK_DB_PASSWORD:?set in .env}
     volumes:
       - spark-checkpoints:/checkpoints
+    # Spark UI answers once the job is up
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4040/api/v1/applications"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       kafka:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
+      timescaledb:
+        condition: service_healthy
     deploy:
       resources:
         limits:
@@ -120,3 +161,4 @@ services:
 volumes:
   kafka-data:
   spark-checkpoints:
+  tsdb-data:

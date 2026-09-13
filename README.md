@@ -1,12 +1,11 @@
-# DLMDWWDE02 — Streaming backend for air quality reporting
+# DLMDWWDE02: Streaming backend for air quality reporting
 
 IU portfolio project (module "Projekt: Data Engineering", task 2): a
 containerized streaming pipeline that ingests air quality measurements as a
 replayed stream and serves windowed aggregates for reporting.
 
 Pipeline: replay producer -> Kafka -> Spark Structured Streaming ->
-TimescaleDB -> Grafana. Runs locally with Docker Compose. Work in progress,
-built up service by service; producer, Kafka and the first Spark query are in.
+TimescaleDB -> Grafana. Runs locally with Docker Compose.
 
 ## Data
 
@@ -45,27 +44,83 @@ converted from the EEA's fixed UTC+1 to UTC. `LATE_EVENT_RATE` holds back a
 share of events by 1-4 hours of event time to exercise late-data handling.
 
 Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions).
+TimescaleDB listens on `localhost:5432` (database `airquality`, roles and
+passwords from `.env`).
 
 ## Processing
 
 The Spark job (`processor/`) reads the topic, parses each event against an
 explicit schema and drops what does not fit (malformed JSON, missing or
-non-numeric fields). Valid events are aggregated into 6-hour tumbling windows
-per station and pollutant (avg/min/max/count) with a 3-hour watermark, so
-a window stays open for three hours after it ends and events arriving later
-than that are discarded. (The producer's 1-4 h late simulation therefore
-passes through; `dropped_late` only counts events for an already closed
-window.) Both counts are logged per micro-batch:
+non-numeric fields). Valid events feed two streaming queries, each with its
+own checkpoint and target table:
 
-    processor-1  | ... batch=12 input=4049 invalid=3 dropped_late=1 output=1086 ...
+| query         | window                          | pollutants  | table             |
+|---------------|---------------------------------|-------------|-------------------|
+| `tumbling_6h` | 6 h tumbling, avg/min/max/count | all         | `agg_tumbling_6h` |
+| `sliding_24h` | 24 h mean sliding by 1 h        | PM10, PM2.5 | `agg_sliding_24h` |
 
-Results currently go to the console (`docker compose logs -f processor`);
-the TimescaleDB sink is next. Checkpoints live on the `spark-checkpoints`
-volume, so a restarted processor resumes where it left off.
+The sliding query mirrors the daily mean the PM limit values are defined on:
+with a 1 h slide there is a window for every full hour, so the CET calendar
+day (23:00-23:00 UTC) is always one of them and the other 23 positions make
+it an hourly early indicator.
 
-`docker compose down -v` resets Kafka data and Spark checkpoints together.
-Do this after changing the query: a checkpoint written by the old query
-cannot be resumed by the new one.
+Both queries use a 3-hour watermark, so a window stays open for three hours
+after it ends and events arriving later than that are discarded. The
+`dropped_late` figure in the log counts what Spark drops at the state store,
+which is pre-aggregated groups per batch (station, pollutant, window), not
+single events; for the sliding query one event touches 24 windows. Every
+micro-batch logs its numbers:
+
+    processor-1  | ... sink=agg_tumbling_6h batch=41 rows=2580 compute_ms=3400 db_ms=60
+    processor-1  | ... query=tumbling_6h batch=41 input=5036 invalid=0 dropped_late=0 state_rows=2618 watermark=2024-01-12T19:00:00.000Z rate=1296/s ms=3776
+
+Each query reads the topic with its own consumer; Structured Streaming does
+not share a source between queries. At the default replay speed (one day
+per minute) and a 10 s trigger a batch holds about four hours of
+measurements and both queries keep up with room to spare
+(`docker compose logs -f processor`). The batch time is Spark's stateful
+processing; the database write takes well under a second per batch
+(`db_ms` in the sink log).
+
+Replay speed, trigger interval and watermark interact: the watermark only
+advances between batches, so an event is dropped when it is later than the
+watermark plus the event time one batch covers. At the default settings
+that is about seven hours, and the producer's 1-4 h late simulation passes
+through untouched even with a 3 s trigger (measured: 0 drops in 76k events
+at 2 % late). An event 11 h old is dropped, as expected.
+
+## Storage
+
+TimescaleDB holds the aggregates in two hypertables (`db/01_schema.sql`),
+chunked by month, with a retention policy. Retention is measured against the
+window time and the replayed data is from 2024, so the policy is set to
+three years; a live feed would use weeks.
+
+The Spark sink is a `foreachBatch` function: each micro-batch is copied
+into a temp table and merged with `INSERT ... ON CONFLICT DO UPDATE` on the
+key (window start, station, pollutant). `foreachBatch` is at-least-once:
+after a crash Spark re-runs the last unfinished batch from the checkpoint,
+and because the rows overwrite themselves that produces no duplicates. So
+this is at-least-once delivery plus an idempotent sink, not exactly-once
+processing; the kill tests rely on it.
+
+Roles are least-privilege (`db/02_roles.sh`, run once when the data volume
+is created): `spark` may SELECT, INSERT and UPDATE the two aggregate tables
+and nothing else (the upsert needs SELECT to check for conflicts), `grafana`
+is read-only. The superuser password is only used by the init scripts.
+
+    docker compose exec timescaledb psql -U grafana -d airquality
+    select * from agg_sliding_24h where station_id = 'DEBB021' order by window_start desc limit 5;
+
+`docker compose down -v` resets Kafka data, Spark checkpoints and the
+database together. Do this after changing a query: a checkpoint written by
+the old query cannot be resumed by the new one, and the aggregates would
+be stale.
+
+The processor image runs Spark 4.1.3 rather than the 4.1.2 named in the
+concept: 4.1.2 fails with a NullPointerException in the Kafka source
+metrics whenever a batch is replayed after a crash (SPARK-55271), which
+turns every restart into a restart loop.
 
 ## Layout
 
@@ -75,7 +130,7 @@ cannot be resumed by the new one.
     preprocess/           one-off merge + sort of the raw files
     producer/             replay producer
     processor/            Spark Structured Streaming job
-    db/                   TimescaleDB init scripts
+    db/                   TimescaleDB schema, hypertables, roles
     grafana/              provisioned datasource + dashboard
     tests/                pytest
     docs/                 architecture and ops notes
