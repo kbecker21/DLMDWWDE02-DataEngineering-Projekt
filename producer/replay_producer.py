@@ -35,23 +35,26 @@ log = logging.getLogger("producer")
 
 
 class Stats:
-    sent = 0
+    produced = 0
+    delivered = 0
     dropped = 0
     failed = 0
 
 
 def delivery(err, msg):
-    if err is not None:
-        Stats.failed += 1
-        if Stats.failed <= 5:
-            log.error("delivery failed: %s", err)
+    if err is None:
+        Stats.delivered += 1
+        return
+    Stats.failed += 1
+    if Stats.failed <= 5:
+        log.error("delivery failed: %s", err)
 
 
 def send(producer, key, payload):
     while True:
         try:
             producer.produce(TOPIC, key=key, value=payload, on_delivery=delivery)
-            Stats.sent += 1
+            Stats.produced += 1
             return
         except BufferError:
             producer.poll(0.1)
@@ -75,7 +78,7 @@ def main():
     seq = 0
     tick = wall_start = first_event = None
     last_log = time.monotonic()
-    sent_at_log = 0
+    delivered_at_log = 0
 
     pf = pq.ParquetFile(REPLAY_FILE)
     log.info("replaying %s (%s rows) at %sx, late event rate %s", REPLAY_FILE, f"{pf.metadata.num_rows:,}", SPEED, LATE_RATE)
@@ -115,16 +118,17 @@ def main():
 
             now = time.monotonic()
             if now - last_log >= LOG_EVERY_S:
-                rate = (Stats.sent - sent_at_log) / (now - last_log)
-                log.info("sent=%s dropped=%s late_pending=%s failed=%s rate=%.0f/s event_time=%s",
-                         f"{Stats.sent:,}", f"{Stats.dropped:,}", len(late), Stats.failed, rate, tick.strftime("%Y-%m-%d %H:%M"))
-                last_log, sent_at_log = now, Stats.sent
+                rate = (Stats.delivered - delivered_at_log) / (now - last_log)
+                log.info("delivered=%s queued=%s dropped=%s late_pending=%s failed=%s rate=%.0f/s event_time=%s",
+                         f"{Stats.delivered:,}", Stats.produced - Stats.delivered - Stats.failed, f"{Stats.dropped:,}",
+                         len(late), Stats.failed, rate, tick.strftime("%Y-%m-%d %H:%M"))
+                last_log, delivered_at_log = now, Stats.delivered
 
     while late:
         _, _, key, payload = heapq.heappop(late)
         send(producer, key, payload)
     producer.flush()
-    log.info("done: sent=%s dropped=%s failed=%s", f"{Stats.sent:,}", f"{Stats.dropped:,}", Stats.failed)
+    log.info("done: delivered=%s dropped=%s failed=%s", f"{Stats.delivered:,}", f"{Stats.dropped:,}", Stats.failed)
     return 1 if Stats.failed else 0
 
 
