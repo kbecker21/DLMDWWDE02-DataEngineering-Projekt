@@ -48,6 +48,10 @@ services:
       timeout: 10s
       retries: 10
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
     restart: unless-stopped
 
   # partition count is fixed on purpose: changing it would remap station keys
@@ -83,8 +87,9 @@ services:
         condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
-    # exits when the replay is through; only restart on errors
-    restart: on-failure
+    # one-shot: exits when the replay is through (see README)
+    restart: "no"
+    init: true
 
   timescaledb:
     image: timescale/timescaledb:2.29.0-pg17
@@ -103,7 +108,7 @@ services:
       - ./db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./db/02_roles.sh:/docker-entrypoint-initdb.d/02_roles.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d ${DB_NAME:-airquality}"]
+      test: ["CMD-SHELL", "pg_isready -h localhost -U postgres -d ${DB_NAME:-airquality}"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -153,9 +158,19 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     ports:
       - "${KAFKA_UI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       kafka:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 768m
     restart: unless-stopped
 
 volumes:

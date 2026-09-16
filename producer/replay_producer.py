@@ -3,6 +3,8 @@
 Event time runs REPLAY_SPEED times faster than wall-clock time (1440 = one day
 per minute). Only measurements with Validity == 1 are sent. Optionally a share
 of events is held back by 1-4 hours of event time to exercise late-data handling.
+
+Runs once: if the topic already holds messages the producer exits right away.
 """
 
 import heapq
@@ -16,7 +18,8 @@ import time
 from datetime import timedelta, timezone
 
 import pyarrow.parquet as pq
-from confluent_kafka import Producer
+from confluent_kafka import Producer, TopicPartition
+from confluent_kafka.admin import AdminClient, OffsetSpec
 
 BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.environ.get("KAFKA_TOPIC", "sensor-events")
@@ -60,6 +63,12 @@ def send(producer, key, payload):
             producer.poll(0.1)
 
 
+def topic_message_count(admin):
+    partitions = admin.list_topics(TOPIC, timeout=10).topics[TOPIC].partitions
+    futures = admin.list_offsets({TopicPartition(TOPIC, p): OffsetSpec.latest() for p in partitions})
+    return sum(f.result().offset for f in futures.values())
+
+
 def wait_until(producer, target):
     while (remaining := target - time.monotonic()) > 0:
         producer.poll(min(remaining, 0.5))
@@ -67,11 +76,18 @@ def wait_until(producer, target):
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # one-shot guard: a second start must not replay the year on top
+    n = topic_message_count(AdminClient({"bootstrap.servers": BOOTSTRAP}))
+    if n:
+        log.info("topic %s already holds %s messages, nothing to do (docker compose down -v to replay)", TOPIC, f"{n:,}")
+        return 0
     producer = Producer({
         "bootstrap.servers": BOOTSTRAP,
         "acks": "all",
         "enable.idempotence": True,
         "linger.ms": 20,
+        # keep retrying through a broker outage instead of failing the run
+        "message.timeout.ms": 30 * 60 * 1000,
     })
     rng = random.Random(0)
     late = []  # (release_time, seq, key, payload)

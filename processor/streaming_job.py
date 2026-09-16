@@ -6,10 +6,10 @@ Two queries run side by side, each with its own checkpoint and target table:
   tumbling_6h   6-hour windows per station and pollutant (avg/min/max/count)
   sliding_24h   24-hour mean sliding by 1 hour, PM10 and PM2.5 only
 
-Events that do not match the JSON schema (or lack a required field) are
-dropped and counted per micro-batch. Late events are tolerated up to the
-3-hour watermark; anything later is dropped by Spark and shows up in the
-batch log as well.
+Events that do not match the JSON schema, lack a required field or carry an
+event time in the future are dropped and counted per micro-batch. Late
+events are tolerated up to the 3-hour watermark; anything later is dropped
+by Spark and shows up in the batch log as well.
 
 The sink is a foreachBatch upsert (INSERT ... ON CONFLICT DO UPDATE) keyed
 by window start, station and pollutant. foreachBatch is at-least-once: after
@@ -152,6 +152,9 @@ def main():
         & F.col("e.event_time").isNotNull()
         & F.col("e.value").isNotNull()
         & ~F.isnan("e.value")
+        # a timestamp in the future would drag the watermark along and turn
+        # every later event into a late one
+        & (F.col("e.event_time") <= F.current_timestamp())
     )
     # each query gets its own copy of this plan and reads the topic itself
     events = (

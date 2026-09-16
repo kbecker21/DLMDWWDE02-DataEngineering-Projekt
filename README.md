@@ -43,6 +43,12 @@ hours). Only validated values (`Validity = 1`) are sent; timestamps are
 converted from the EEA's fixed UTC+1 to UTC. `LATE_EVENT_RATE` holds back a
 share of events by 1-4 hours of event time to exercise late-data handling.
 
+The producer is a one-shot: it exits when the replay is through and is not
+restarted. If the topic already holds messages it exits right away, so a
+second `docker compose up` does not replay the year on top; `docker compose
+down -v` starts over. While the broker is down it keeps its events queued
+for up to 30 minutes before it gives up and exits with an error.
+
 Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions).
 TimescaleDB listens on `localhost:5432` (database `airquality`, roles and
 passwords from `.env`).
@@ -51,8 +57,10 @@ passwords from `.env`).
 
 The Spark job (`processor/`) reads the topic, parses each event against an
 explicit schema and drops what does not fit (malformed JSON, missing or
-non-numeric fields). Valid events feed two streaming queries, each with its
-own checkpoint and target table:
+non-numeric fields, an event time in the future). The last one matters: a
+single message dated years ahead would move the watermark there and every
+following event would be late. Valid events feed two streaming queries,
+each with its own checkpoint and target table:
 
 | query         | window                          | pollutants  | table             |
 |---------------|---------------------------------|-------------|-------------------|
@@ -121,6 +129,13 @@ The processor image runs Spark 4.1.3 rather than the 4.1.2 named in the
 concept: 4.1.2 fails with a NullPointerException in the Kafka source
 metrics whenever a batch is replayed after a crash (SPARK-55271), which
 turns every restart into a restart loop.
+
+## Operations
+
+Every service has a healthcheck, a memory limit and `restart: unless-stopped`
+(the one-shot producer excepted); the processor waits for Kafka and the
+database to be healthy. Killing a container while the replay runs is
+covered in `docs/kill-tests.md`.
 
 ## Layout
 
