@@ -49,9 +49,9 @@ second `docker compose up` does not replay the year on top; `docker compose
 down -v` starts over. While the broker is down it keeps its events queued
 for up to 30 minutes before it gives up and exits with an error.
 
-Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions).
-TimescaleDB listens on `localhost:5432` (database `airquality`, roles and
-passwords from `.env`).
+Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions),
+Grafana at http://localhost:3000. TimescaleDB listens on `localhost:5432`
+(database `airquality`, roles and passwords from `.env`).
 
 ## Processing
 
@@ -129,6 +129,20 @@ The processor image runs Spark 4.1.3 rather than the 4.1.2 named in the
 concept: 4.1.2 fails with a NullPointerException in the Kafka source
 metrics whenever a batch is replayed after a crash (SPARK-55271), which
 turns every restart into a restart loop.
+
+## Dashboard
+
+Grafana is at http://localhost:3000, no login needed to view (anonymous
+Viewer; admin password in `.env` for editing). Datasource and dashboard
+are provisioned from `grafana/`, the datasource connects with the
+read-only `grafana` role. The dashboard opens on the year 2024, the event
+time of the data; a relative range like "last 6 hours" would be empty.
+It refreshes every 10 s and shows, per selected station, the 6 h means
+of all pollutants and the 24 h PM10/PM2.5 means with the EU daily limit
+for PM10 as reference line. Sliding windows with fewer than 18 of 24
+hourly values are hidden there (the 75 % data-capture rule for a valid
+daily mean). The stat row on top shows how far the replay has got and
+when the sink last wrote.
 
 ## Operations
 
