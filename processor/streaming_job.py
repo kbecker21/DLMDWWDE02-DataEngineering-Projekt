@@ -32,14 +32,6 @@ KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.environ.get("KAFKA_TOPIC", "sensor-events")
 TRIGGER_SECONDS = int(os.environ.get("TRIGGER_SECONDS", "10"))
 CHECKPOINT_DIR = os.environ.get("CHECKPOINT_DIR", "/checkpoints")
-DB = psycopg.conninfo.make_conninfo(
-    host=os.environ.get("DB_HOST", "timescaledb"),
-    dbname=os.environ.get("DB_NAME", "airquality"),
-    user=os.environ.get("DB_USER", "spark"),
-    password=os.environ["DB_PASSWORD"],
-    connect_timeout=10,
-)
-
 WATERMARK = "3 hours"
 PM = ["PM10", "PM25"]
 
@@ -94,6 +86,16 @@ def _as_db_value(v):
     return v
 
 
+def db_conninfo():
+    return psycopg.conninfo.make_conninfo(
+        host=os.environ.get("DB_HOST", "timescaledb"),
+        dbname=os.environ.get("DB_NAME", "airquality"),
+        user=os.environ.get("DB_USER", "spark"),
+        password=os.environ["DB_PASSWORD"],
+        connect_timeout=10,
+    )
+
+
 def merge_sql(table, cols):
     """INSERT ... ON CONFLICT DO UPDATE from the staging table into `table`."""
     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in UPSERT_KEY)
@@ -103,7 +105,7 @@ def merge_sql(table, cols):
     )
 
 
-def upsert_sink(table):
+def upsert_sink(table, db):
     """foreachBatch function: COPY the batch into a temp table and merge it
     into the target in one statement. A failure raises, which stops the
     query; the container restarts and Spark re-runs the batch from the
@@ -117,7 +119,7 @@ def upsert_sink(table):
         rows = batch_df.collect()
         t1 = time.monotonic()
         if rows:
-            with psycopg.connect(DB) as conn, conn.cursor() as cur:
+            with psycopg.connect(db) as conn, conn.cursor() as cur:
                 cur.execute(f"CREATE TEMP TABLE staging (LIKE {table} INCLUDING DEFAULTS) ON COMMIT DROP")
                 with cur.copy(f"COPY staging ({', '.join(cols)}) FROM STDIN") as copy:
                     for row in rows:
@@ -130,20 +132,9 @@ def upsert_sink(table):
     return write
 
 
-def main():
-    spark = SparkSession.builder.appName("sensor-processor").getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
-    spark.streams.addListener(BatchLog())
-
-    raw = (
-        spark.readStream.format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
-        .option("subscribe", TOPIC)
-        .option("startingOffsets", "earliest")
-        .option("maxOffsetsPerTrigger", 500_000)
-        .load()
-    )
-
+def valid_events(raw):
+    """Parse the Kafka value column against EVENT_SCHEMA and keep what fits.
+    Rows that fail are counted in the `validation` metric."""
     parsed = raw.select(F.from_json(F.col("value").cast("string"), EVENT_SCHEMA).alias("e"))
     valid = (
         F.col("e").isNotNull()
@@ -156,16 +147,16 @@ def main():
         # every later event into a late one
         & (F.col("e.event_time") <= F.current_timestamp())
     )
-    # each query gets its own copy of this plan and reads the topic itself
-    events = (
+    return (
         parsed.withColumn("valid", valid)
         .observe("validation", F.count(F.when(~F.col("valid"), 1)).alias("invalid"))
         .where("valid")
         .select("e.*")
-        .withWatermark("event_time", WATERMARK)
     )
 
-    tumbling = (
+
+def tumbling_6h(events):
+    return (
         events.groupBy(F.window("event_time", "6 hours"), "station_id", "pollutant")
         .agg(
             F.avg("value").alias("avg_value"),
@@ -180,10 +171,12 @@ def main():
         )
     )
 
+
+def sliding_24h(events):
     # With a 1-hour slide a window starts at every full hour, so the CET
     # calendar day the PM limit values refer to (23:00-23:00 UTC) is always
     # one of them; no startTime offset needed.
-    sliding = (
+    return (
         events.where(F.col("pollutant").isin(PM))
         .groupBy(F.window("event_time", "24 hours", "1 hour"), "station_id", "pollutant")
         .agg(F.avg("value").alias("avg_value"), F.count("*").alias("n_values"))
@@ -194,14 +187,32 @@ def main():
         )
     )
 
+
+def main():
+    db = db_conninfo()
+    spark = SparkSession.builder.appName("sensor-processor").getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    spark.streams.addListener(BatchLog())
+
+    raw = (
+        spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+        .option("subscribe", TOPIC)
+        .option("startingOffsets", "earliest")
+        .option("maxOffsetsPerTrigger", 500_000)
+        .load()
+    )
+    # each query gets its own copy of this plan and reads the topic itself
+    events = valid_events(raw).withWatermark("event_time", WATERMARK)
+
     for name, df, table in [
-        ("tumbling_6h", tumbling, "agg_tumbling_6h"),
-        ("sliding_24h", sliding, "agg_sliding_24h"),
+        ("tumbling_6h", tumbling_6h(events), "agg_tumbling_6h"),
+        ("sliding_24h", sliding_24h(events), "agg_sliding_24h"),
     ]:
         (
             df.writeStream.queryName(name)
             .outputMode("update")
-            .foreachBatch(upsert_sink(table))
+            .foreachBatch(upsert_sink(table, db))
             .option("checkpointLocation", f"{CHECKPOINT_DIR}/{name}")
             .trigger(processingTime=f"{TRIGGER_SECONDS} seconds")
             .start()

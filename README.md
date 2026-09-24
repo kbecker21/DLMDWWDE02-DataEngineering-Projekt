@@ -7,6 +7,11 @@ replayed stream and serves windowed aggregates for reporting.
 Pipeline: replay producer -> Kafka -> Spark Structured Streaming ->
 TimescaleDB -> Grafana. Runs locally with Docker Compose.
 
+![Architecture](docs/architecture.png)
+
+(Sketch from the concept phase, labels in German; the preprocess step
+between download and producer is not drawn.)
+
 ## Data
 
 EEA air quality data (dataset E1a, validated hourly values), Germany 2024,
@@ -26,7 +31,9 @@ so the stack can be tried without downloading anything: set
 
 Data © [European Environment Agency](https://www.eea.europa.eu/), licensed
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The release mirror
-is an unmodified subset (year 2024, Germany) of that dataset.
+is an unmodified subset (year 2024, Germany) of that dataset. Provenance,
+validation, access control and retention are written up in
+`docs/governance.md`.
 
 ## Setup
 
@@ -151,6 +158,49 @@ Every service has a healthcheck, a memory limit and `restart: unless-stopped`
 database to be healthy. Killing a container while the replay runs is
 covered in `docs/kill-tests.md`.
 
+## Tests
+
+    docker compose run --rm tests
+
+Runs pytest in a container built on the processor's Spark image, no local
+Python needed. The unit tests cover the producer's event construction, the
+preprocess step (against the sample in `data/sample/`) and the processor's
+validation and window logic on a local SparkSession, checked against a
+plain Python computation of the same aggregates. They need no running
+stack.
+
+`tests/test_e2e.py` is a smoke test of the whole stack and skips itself
+when Kafka is not reachable. It waits until every validated row of the
+replay file has arrived in the topic and in both aggregate tables, compares
+one window with the raw values, and asks Grafana for the dashboard. Run it
+against the sample with the replay sped up:
+
+    DATA_DIR=./data/sample docker compose run --rm preprocess
+    DATA_DIR=./data/sample REPLAY_SPEED=1000000 docker compose up -d
+    docker compose run --rm tests
+
+The whole run takes about a minute after the stack is healthy. Switch
+`DATA_DIR` back and run the preprocess step again before replaying the
+full dataset.
+
+## Troubleshooting
+
+- **Memory.** The limits in the Compose file add up to about 8 GB, in use
+  the stack takes about 3 GB. On Windows give WSL2 at least 8 GB in
+  `%UserProfile%\.wslconfig` (`memory=8GB`) and restart Docker Desktop.
+- **Port already in use.** Change `KAFKA_HOST_PORT`, `KAFKA_UI_PORT`,
+  `DB_PORT` or `GRAFANA_PORT` in `.env`.
+- **Producer exits right away** with "already holds ... messages": the
+  topic still has the previous replay. `docker compose down -v` resets it.
+- **Preprocess says "No parquet files"**: `DATA_DIR` in `.env` points to a
+  directory without data. Run the downloader or set it to `./data/sample`.
+- **Processor restarts after a code change**: an old checkpoint does not
+  fit the new query. `docker compose down -v`, then `up -d --build`.
+- **Dashboard edits in `grafana/dashboards/` do not show up**:
+  `docker compose restart grafana`.
+- **Git Bash on Windows** rewrites container paths like `/opt/kafka/...` in
+  `docker compose exec` calls; prefix the command with `MSYS_NO_PATHCONV=1`.
+
 ## Layout
 
     docker-compose.yml    full stack (infrastructure as code)
@@ -161,8 +211,8 @@ covered in `docs/kill-tests.md`.
     processor/            Spark Structured Streaming job
     db/                   TimescaleDB schema, hypertables, roles
     grafana/              provisioned datasource + dashboard
-    tests/                pytest
-    docs/                 architecture and ops notes
+    tests/                pytest: unit tests and end-to-end smoke test
+    docs/                 architecture, governance, kill tests
 
 ## Requirements
 

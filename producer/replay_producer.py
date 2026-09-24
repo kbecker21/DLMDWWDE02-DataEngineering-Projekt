@@ -63,6 +63,23 @@ def send(producer, key, payload):
             producer.poll(0.1)
 
 
+def to_event(row):
+    """One measurement -> (key, event time, JSON payload); None for values that
+    are not validated (Validity != 1)."""
+    if row["Validity"] != 1:
+        return None
+    event_time = (row["Start"] - SOURCE_OFFSET).replace(tzinfo=timezone.utc)
+    station = STATION_RE.search(row["Samplingpoint"]).group(1)
+    payload = json.dumps({
+        "station_id": station,
+        "pollutant": POLLUTANTS.get(row["Pollutant"], str(row["Pollutant"])),
+        "event_time": event_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "value": float(row["Value"]),
+        "unit": row["Unit"],
+    }).encode()
+    return station.encode(), event_time, payload
+
+
 def topic_message_count(admin):
     partitions = admin.list_topics(TOPIC, timeout=10).topics[TOPIC].partitions
     futures = admin.list_offsets({TopicPartition(TOPIC, p): OffsetSpec.latest() for p in partitions})
@@ -101,10 +118,11 @@ def main():
 
     for batch in pf.iter_batches(batch_size=50_000, columns=COLUMNS):
         for row in batch.to_pylist():
-            if row["Validity"] != 1:
+            event = to_event(row)
+            if event is None:
                 Stats.dropped += 1
                 continue
-            event_time = (row["Start"] - SOURCE_OFFSET).replace(tzinfo=timezone.utc)
+            key, event_time, payload = event
 
             if event_time != tick:
                 tick = event_time
@@ -112,18 +130,8 @@ def main():
                     first_event, wall_start = tick, time.monotonic()
                 wait_until(producer, wall_start + (tick - first_event).total_seconds() / SPEED)
                 while late and late[0][0] <= tick:
-                    _, _, key, payload = heapq.heappop(late)
-                    send(producer, key, payload)
-
-            station = STATION_RE.search(row["Samplingpoint"]).group(1)
-            payload = json.dumps({
-                "station_id": station,
-                "pollutant": POLLUTANTS.get(row["Pollutant"], str(row["Pollutant"])),
-                "event_time": event_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "value": float(row["Value"]),
-                "unit": row["Unit"],
-            }).encode()
-            key = station.encode()
+                    _, _, late_key, late_payload = heapq.heappop(late)
+                    send(producer, late_key, late_payload)
 
             if LATE_RATE and rng.random() < LATE_RATE:
                 release = tick + timedelta(hours=rng.uniform(*LATE_DELAY_HOURS))
