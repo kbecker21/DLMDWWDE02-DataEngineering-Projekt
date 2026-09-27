@@ -1,7 +1,6 @@
 #!/bin/bash
-# Least-privilege roles. Passwords come from the environment (.env), the
-# superuser is only used by this init step. No set -e here: the entrypoint
-# sources this file when it is not executable, ON_ERROR_STOP does the job.
+# Roles for Spark and Grafana, passwords from .env. No set -e: the entrypoint
+# may source this file.
 
 psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
      -v spark_pw="$SPARK_DB_PASSWORD" -v grafana_pw="$GRAFANA_DB_PASSWORD" <<-'EOSQL'

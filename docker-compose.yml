@@ -39,7 +39,7 @@ services:
       KAFKA_LOG_DIRS: /var/lib/kafka/data
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
     ports:
-      - "${KAFKA_HOST_PORT:-29092}:29092"
+      - "127.0.0.1:${KAFKA_HOST_PORT:-29092}:29092"
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
@@ -54,7 +54,7 @@ services:
           memory: 2g
     restart: unless-stopped
 
-  # partition count is fixed on purpose: changing it would remap station keys
+  # changing the partition count would remap station keys
   kafka-init:
     image: apache/kafka:4.3.1
     depends_on:
@@ -100,11 +100,10 @@ services:
       SPARK_DB_PASSWORD: ${SPARK_DB_PASSWORD:?set in .env}
       GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?set in .env}
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
       - tsdb-data:/var/lib/postgresql/data
-      # init scripts only run when the data volume is empty; mounted one by
-      # one so the image's own extension setup in that directory stays
+      # mounted one by one so the image's own init script stays visible
       - ./db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./db/02_roles.sh:/docker-entrypoint-initdb.d/02_roles.sh:ro
     healthcheck:
@@ -157,7 +156,7 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     ports:
-      - "${KAFKA_UI_PORT:-8080}:8080"
+      - "127.0.0.1:${KAFKA_UI_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/actuator/health"]
       interval: 30s
@@ -184,7 +183,7 @@ services:
       DB_NAME: ${DB_NAME:-airquality}
       GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?set in .env}
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro

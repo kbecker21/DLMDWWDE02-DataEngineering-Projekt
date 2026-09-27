@@ -1,21 +1,5 @@
-"""Spark Structured Streaming job: validates sensor events from Kafka and
-writes windowed aggregates to TimescaleDB.
-
-Two queries run side by side, each with its own checkpoint and target table:
-
-  tumbling_6h   6-hour windows per station and pollutant (avg/min/max/count)
-  sliding_24h   24-hour mean sliding by 1 hour, PM10 and PM2.5 only
-
-Events that do not match the JSON schema, lack a required field or carry an
-event time in the future are dropped and counted per micro-batch. Late
-events are tolerated up to the 3-hour watermark; anything later is dropped
-by Spark and shows up in the batch log as well.
-
-The sink is a foreachBatch upsert (INSERT ... ON CONFLICT DO UPDATE) keyed
-by window start, station and pollutant. foreachBatch is at-least-once: after
-a restart Spark re-runs the last unfinished batch, and the upsert makes that
-harmless because the rows overwrite themselves.
-"""
+"""Reads sensor events from Kafka, drops invalid ones and upserts 6 h tumbling
+and 24 h sliding aggregates into TimescaleDB."""
 
 import logging
 import os
@@ -52,7 +36,7 @@ logging.getLogger("py4j").setLevel(logging.WARNING)
 
 
 class BatchLog(StreamingQueryListener):
-    """One log line per micro-batch with the numbers that matter for ops."""
+    """Logs one line per micro-batch."""
 
     def onQueryStarted(self, event):
         log.info("query started: %s", event.name)
@@ -106,16 +90,13 @@ def merge_sql(table, cols):
 
 
 def upsert_sink(table, db):
-    """foreachBatch function: COPY the batch into a temp table and merge it
-    into the target in one statement. A failure raises, which stops the
-    query; the container restarts and Spark re-runs the batch from the
-    checkpoint."""
+    """COPY the batch into a temp table and merge it into `table`. On error the
+    query stops and Spark re-runs the batch after the restart."""
 
     def write(batch_df, batch_id):
         t0 = time.monotonic()
         cols = batch_df.columns
-        # aggregates are small (thousands of rows per batch), so collecting
-        # them on the driver is fine and keeps the write in one transaction
+        # a few thousand rows per batch, fine to collect on the driver
         rows = batch_df.collect()
         t1 = time.monotonic()
         if rows:
@@ -143,8 +124,7 @@ def valid_events(raw):
         & F.col("e.event_time").isNotNull()
         & F.col("e.value").isNotNull()
         & ~F.isnan("e.value")
-        # a timestamp in the future would drag the watermark along and turn
-        # every later event into a late one
+        # a future timestamp would push the watermark ahead
         & (F.col("e.event_time") <= F.current_timestamp())
     )
     return (
@@ -173,9 +153,7 @@ def tumbling_6h(events):
 
 
 def sliding_24h(events):
-    # With a 1-hour slide a window starts at every full hour, so the CET
-    # calendar day the PM limit values refer to (23:00-23:00 UTC) is always
-    # one of them; no startTime offset needed.
+    # a window starts every hour, so the CET day (23:00-23:00 UTC) is one of them
     return (
         events.where(F.col("pollutant").isin(PM))
         .groupBy(F.window("event_time", "24 hours", "1 hour"), "station_id", "pollutant")

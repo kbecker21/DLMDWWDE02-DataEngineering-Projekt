@@ -1,219 +1,131 @@
 # DLMDWWDE02: Streaming backend for air quality reporting
 
-IU portfolio project (module "Projekt: Data Engineering", task 2): a
-containerized streaming pipeline that ingests air quality measurements as a
-replayed stream and serves windowed aggregates for reporting.
+IU portfolio project (module "Projekt: Data Engineering", task 2).
+Replays air quality measurements as a stream and serves windowed aggregates
+for reporting.
 
-Pipeline: replay producer -> Kafka -> Spark Structured Streaming ->
-TimescaleDB -> Grafana. Runs locally with Docker Compose.
+replay producer -> Kafka -> Spark Structured Streaming -> TimescaleDB -> Grafana
 
 ![Architecture](docs/architecture.png)
 
-(Sketch from the concept phase, labels in German; the preprocess step
-between download and producer is not drawn.)
+(Concept sketch, German labels; the preprocess step is not drawn.)
 
 ## Data
 
-EEA air quality data (dataset E1a, validated hourly values), Germany 2024,
-pollutants NO2, O3, PM10, PM2.5: 1,380 station time series, ~12.1M rows.
+EEA air quality, dataset E1a (validated hourly values), Germany 2024, NO2,
+O3, PM10, PM2.5: 1,380 series, ~12.1M rows. Source:
+[EEA download service](https://eeadmz1-downloads-webapp.azurewebsites.net),
+© [European Environment Agency](https://www.eea.europa.eu/),
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
-Download (one-off setup step, ~380 MB transfer):
+The downloader tries the EEA API, then the EEA blob container, then a mirror
+on this repo's GitHub release. `data/sample/` has 4 Berlin stations (~3 MB)
+for a run without download.
 
-    docker compose run --rm downloader
-
-The downloader tries the EEA download API first, then the public blob
-container, then a mirror of the 2024 cut attached to a GitHub release.
-Output goes to `data/eea_e1a_2024/` (gitignored). Re-running resumes.
-
-There is also a small sample in `data/sample/` (4 Berlin stations, ~3 MB),
-so the stack can be tried without downloading anything: set
-`DATA_DIR=./data/sample` in `.env`.
-
-Data © [European Environment Agency](https://www.eea.europa.eu/), licensed
-[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The release mirror
-is an unmodified subset (year 2024, Germany) of that dataset. Provenance,
-validation, access control and retention are written up in
-`docs/governance.md`.
-
-## Setup
+## Quick start
 
     cp .env.example .env
-    docker compose run --rm downloader     # once, skip when using the sample
-    docker compose run --rm preprocess     # merge + sort -> data/replay/events.parquet
+    docker compose run --rm downloader     # skip with DATA_DIR=./data/sample
+    docker compose run --rm preprocess     # -> data/replay/events.parquet
     docker compose up -d
 
-The preprocess step merges the per-station files into one file sorted by
-timestamp. The producer replays it into Kafka as one JSON event per
-measurement, keyed by station, with event time running `REPLAY_SPEED` times
-faster than wall clock (default: one day per minute, so 2024 takes about six
-hours). Only validated values (`Validity = 1`) are sent; timestamps are
-converted from the EEA's fixed UTC+1 to UTC. `LATE_EVENT_RATE` holds back a
-share of events by 1-4 hours of event time to exercise late-data handling.
+| service     | URL                    |
+|-------------|------------------------|
+| Grafana     | http://localhost:3000  |
+| Kafka-UI    | http://localhost:8080  |
+| TimescaleDB | localhost:5432, db `airquality` |
+| Kafka       | localhost:29092        |
 
-The producer is a one-shot: it exits when the replay is through and is not
-restarted. If the topic already holds messages it exits right away, so a
-second `docker compose up` does not replay the year on top; `docker compose
-down -v` starts over. While the broker is down it keeps its events queued
-for up to 30 minutes before it gives up and exits with an error.
+All ports are bound to 127.0.0.1 and can be changed in `.env`.
 
-Kafka-UI is at http://localhost:8080 (topic `sensor-events`, 12 partitions),
-Grafana at http://localhost:3000. TimescaleDB listens on `localhost:5432`
-(database `airquality`, roles and passwords from `.env`).
+## Pipeline
 
-## Processing
+- **Producer** (`producer/`): one JSON event per measurement, key = station
+  id, `acks=all`. Replay speed `REPLAY_SPEED` (default 1440 = one day per
+  minute, 2024 in ~6 h). Sends only `Validity = 1`, converts UTC+1 to UTC.
+  `LATE_EVENT_RATE` delays a share of events by 1-4 h. Runs once; exits if
+  the topic is not empty.
+- **Kafka**: topic `sensor-events`, 12 partitions, created by `kafka-init`
+  (auto-create off).
+- **Processor** (`processor/`): `from_json` against a fixed schema, drops
+  malformed events and events dated in the future, 3 h watermark, output
+  mode `update`, one checkpoint per query:
 
-The Spark job (`processor/`) reads the topic, parses each event against an
-explicit schema and drops what does not fit (malformed JSON, missing or
-non-numeric fields, an event time in the future). The last one matters: a
-single message dated years ahead would move the watermark there and every
-following event would be late. Valid events feed two streaming queries,
-each with its own checkpoint and target table:
+  | query         | window                          | pollutants  | table             |
+  |---------------|---------------------------------|-------------|-------------------|
+  | `tumbling_6h` | 6 h tumbling, avg/min/max/count | all         | `agg_tumbling_6h` |
+  | `sliding_24h` | 24 h, slide 1 h, avg/count      | PM10, PM2.5 | `agg_sliding_24h` |
 
-| query         | window                          | pollutants  | table             |
-|---------------|---------------------------------|-------------|-------------------|
-| `tumbling_6h` | 6 h tumbling, avg/min/max/count | all         | `agg_tumbling_6h` |
-| `sliding_24h` | 24 h mean sliding by 1 h        | PM10, PM2.5 | `agg_sliding_24h` |
+  The 24 h window matches the daily mean of the PM limit values.
+- **Sink**: `foreachBatch`, COPY into a temp table, `INSERT ... ON CONFLICT
+  DO UPDATE`. At-least-once plus idempotent upsert: a batch re-run after a
+  crash overwrites its own rows.
+- **TimescaleDB**: two hypertables, monthly chunks, 3-year retention
+  (the data is from 2024).
+- **Grafana**: provisioned datasource (read-only role) and dashboard, fixed
+  to 2024, anonymous view.
 
-The sliding query mirrors the daily mean the PM limit values are defined on:
-with a 1 h slide there is a window for every full hour, so the CET calendar
-day (23:00-23:00 UTC) is always one of them and the other 23 positions make
-it an hourly early indicator.
+Per batch log line:
 
-Both queries use a 3-hour watermark, so a window stays open for three hours
-after it ends and events arriving later than that are discarded. The
-`dropped_late` figure in the log counts what Spark drops at the state store,
-which is pre-aggregated groups per batch (station, pollutant, window), not
-single events; for the sliding query one event touches 24 windows. Every
-micro-batch logs its numbers:
+    query=tumbling_6h batch=41 input=5036 invalid=0 dropped_late=0 state_rows=2618 watermark=2024-01-12T19:00:00.000Z rate=1296/s ms=3776
+    sink=agg_tumbling_6h batch=41 rows=2580 compute_ms=3400 db_ms=60
 
-    processor-1  | ... sink=agg_tumbling_6h batch=41 rows=2580 compute_ms=3400 db_ms=60
-    processor-1  | ... query=tumbling_6h batch=41 input=5036 invalid=0 dropped_late=0 state_rows=2618 watermark=2024-01-12T19:00:00.000Z rate=1296/s ms=3776
+`dropped_late` counts aggregated groups, not events. The watermark moves
+only between batches, so at default settings events are dropped only after
+~7 h delay.
 
-Each query reads the topic with its own consumer; Structured Streaming does
-not share a source between queries. At the default replay speed (one day
-per minute) and a 10 s trigger a batch holds about four hours of
-measurements and both queries keep up with room to spare
-(`docker compose logs -f processor`). The batch time is Spark's stateful
-processing; the database write takes well under a second per batch
-(`db_ms` in the sink log).
+Latency: new data reaches the tables within one trigger (10 s) plus batch
+time (3.5-6 s), i.e. under 20 s.
 
-Replay speed, trigger interval and watermark interact: the watermark only
-advances between batches, so an event is dropped when it is later than the
-watermark plus the event time one batch covers. At the default settings
-that is about seven hours, and the producer's 1-4 h late simulation passes
-through untouched even with a 3 s trigger (measured: 0 drops in 76k events
-at 2 % late). An event 11 h old is dropped, as expected.
+## Scaling
 
-## Storage
-
-TimescaleDB holds the aggregates in two hypertables (`db/01_schema.sql`),
-chunked by month, with a retention policy. Retention is measured against the
-window time and the replayed data is from 2024, so the policy is set to
-three years; a live feed would use weeks.
-
-The Spark sink is a `foreachBatch` function: each micro-batch is copied
-into a temp table and merged with `INSERT ... ON CONFLICT DO UPDATE` on the
-key (window start, station, pollutant). `foreachBatch` is at-least-once:
-after a crash Spark re-runs the last unfinished batch from the checkpoint,
-and because the rows overwrite themselves that produces no duplicates. So
-this is at-least-once delivery plus an idempotent sink, not exactly-once
-processing; the kill tests rely on it.
-
-Roles are least-privilege (`db/02_roles.sh`, run once when the data volume
-is created): `spark` may SELECT, INSERT and UPDATE the two aggregate tables
-and nothing else (the upsert needs SELECT to check for conflicts), `grafana`
-is read-only. The superuser password is only used by the init scripts.
-
-    docker compose exec timescaledb psql -U grafana -d airquality
-    select * from agg_sliding_24h where station_id = 'DEBB021' order by window_start desc limit 5;
-
-`docker compose down -v` resets Kafka data, Spark checkpoints and the
-database together. Do this after changing a query: a checkpoint written by
-the old query cannot be resumed by the new one, and the aggregates would
-be stale.
-
-The processor image runs Spark 4.1.3 rather than the 4.1.2 named in the
-concept: 4.1.2 fails with a NullPointerException in the Kafka source
-metrics whenever a batch is replayed after a crash (SPARK-55271), which
-turns every restart into a restart loop.
-
-## Dashboard
-
-Grafana is at http://localhost:3000, no login needed to view (anonymous
-Viewer; admin password in `.env` for editing). Datasource and dashboard
-are provisioned from `grafana/`, the datasource connects with the
-read-only `grafana` role. The dashboard opens on the year 2024, the event
-time of the data; a relative range like "last 6 hours" would be empty.
-It refreshes every 10 s and shows, per selected station, the 6 h means
-of all pollutants and the 24 h PM10/PM2.5 means with the EU daily limit
-for PM10 as reference line. Sliding windows with fewer than 18 of 24
-hourly values are hidden there (the 75 % data-capture rule for a valid
-daily mean). The stat row on top shows how far the replay has got and
-when the sink last wrote.
+- Kafka: 12 partitions allow up to 12 parallel consumers/tasks. The station
+  key keeps per-station order. Production: 3 brokers, replication factor 3.
+- Spark: runs `local[2]` in one container; the same job runs on a cluster
+  by changing `--master`. `maxOffsetsPerTrigger` caps batch size.
+- TimescaleDB: time-partitioned chunks; the upsert key is the primary key.
+- Measured on one laptop: ~1,300-1,500 events/s per query, full year
+  without backlog at the default replay speed.
 
 ## Operations
 
-Every service has a healthcheck, a memory limit and `restart: unless-stopped`
-(the one-shot producer excepted); the processor waits for Kafka and the
-database to be healthy. Killing a container while the replay runs is
-covered in `docs/kill-tests.md`.
+- Healthchecks and memory limits on all long-running services,
+  `restart: unless-stopped`. Producer, `kafka-init`, downloader and
+  preprocess are one-shot.
+- `docker compose down -v` resets Kafka, checkpoints and database. Needed
+  after changing a query.
+- Spark 4.1.3 instead of 4.1.2 (concept): 4.1.2 hits SPARK-55271 when a
+  batch is re-run after a crash.
+- Kill tests: `docs/kill-tests.md`. Governance, roles, retention:
+  `docs/governance.md`.
 
 ## Tests
 
     docker compose run --rm tests
 
-Runs pytest in a container built on the processor's Spark image, no local
-Python needed. The unit tests cover the producer's event construction, the
-preprocess step (against the sample in `data/sample/`) and the processor's
-validation and window logic on a local SparkSession, checked against a
-plain Python computation of the same aggregates. They need no running
-stack.
-
-`tests/test_e2e.py` is a smoke test of the whole stack and skips itself
-when Kafka is not reachable. It waits until every validated row of the
-replay file has arrived in the topic and in both aggregate tables, compares
-one window with the raw values, and asks Grafana for the dashboard. Run it
-against the sample with the replay sped up:
+Unit tests (producer, preprocess, Spark logic) need no running stack.
+`tests/test_e2e.py` checks topic, tables and Grafana of the running stack
+and skips without Kafka. With the sample:
 
     DATA_DIR=./data/sample docker compose run --rm preprocess
     DATA_DIR=./data/sample REPLAY_SPEED=1000000 docker compose up -d
     docker compose run --rm tests
 
-The whole run takes about a minute after the stack is healthy. Switch
-`DATA_DIR` back and run the preprocess step again before replaying the
-full dataset.
-
 ## Troubleshooting
 
-- **Memory.** The limits in the Compose file add up to about 8 GB, in use
-  the stack takes about 3 GB. On Windows give WSL2 at least 8 GB in
-  `%UserProfile%\.wslconfig` (`memory=8GB`) and restart Docker Desktop.
-- **Port already in use.** Change `KAFKA_HOST_PORT`, `KAFKA_UI_PORT`,
-  `DB_PORT` or `GRAFANA_PORT` in `.env`.
-- **Producer exits right away** with "already holds ... messages": the
-  topic still has the previous replay. `docker compose down -v` resets it.
-- **Preprocess says "No parquet files"**: `DATA_DIR` in `.env` points to a
-  directory without data. Run the downloader or set it to `./data/sample`.
-- **Processor restarts after a code change**: an old checkpoint does not
-  fit the new query. `docker compose down -v`, then `up -d --build`.
-- **Dashboard edits in `grafana/dashboards/` do not show up**:
-  `docker compose restart grafana`.
-- **Git Bash on Windows** rewrites container paths like `/opt/kafka/...` in
-  `docker compose exec` calls; prefix the command with `MSYS_NO_PATHCONV=1`.
+- Memory: stack uses ~3 GB; give WSL2 at least 8 GB (`.wslconfig`).
+- Port in use: change it in `.env`.
+- Producer exits "already holds ... messages": `docker compose down -v`.
+- Processor restarts after a code change: old checkpoint, `down -v`.
+- Dashboard change not visible: `docker compose restart grafana`.
+- Git Bash: prefix `docker compose exec` with `MSYS_NO_PATHCONV=1`.
 
 ## Layout
 
-    docker-compose.yml    full stack (infrastructure as code)
-    .env.example          config template, copy to .env
-    downloader/           one-off data downloader
-    preprocess/           one-off merge + sort of the raw files
-    producer/             replay producer
-    processor/            Spark Structured Streaming job
-    db/                   TimescaleDB schema, hypertables, roles
-    grafana/              provisioned datasource + dashboard
-    tests/                pytest: unit tests and end-to-end smoke test
-    docs/                 architecture, governance, kill tests
+    downloader/  preprocess/  producer/  processor/
+    db/          schema and roles
+    grafana/     datasource and dashboard
+    tests/       pytest
+    docs/        architecture, governance, kill tests
 
-## Requirements
-
-Docker Desktop (developed on Windows 11 / WSL2). No local Python needed.
+Requires Docker Desktop (developed on Windows 11 / WSL2).
